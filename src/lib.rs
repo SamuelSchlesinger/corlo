@@ -1,7 +1,6 @@
 #![feature(generic_associated_types)]
-#![feature(adt_const_parameters)]
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, rc::Rc};
 
 struct Sequence<Component, Path> {
     component: Component,
@@ -33,29 +32,41 @@ struct QueryParam<Name, Ty> {
 }
 
 trait HasLink {
-    type MkLink<A>;
+    type MkLink<'a, A: 'a>;
 
-    fn to_link<A, F: Fn(Link) -> A>(self, f: F, link: Link) -> Self::MkLink<A>;
+    fn to_link<'a, A: 'a>(self, f: Rc<dyn Fn(Link) -> A + 'a>, link: Link) -> Self::MkLink<'a, A>;
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Link {
     segments: Vec<Escaped>,
     query_params: Vec<Param>,
     fragment: Option<String>,
 }
 
+impl Default for Link {
+    fn default() -> Link {
+        Link {
+            segments: Vec::new(),
+            query_params: Vec::new(),
+            fragment: None,
+        }
+    }
+}
+
 impl Link {
-    fn add_segment(self, seg: Escaped) -> Self {
+    fn add_segment(mut self, seg: Escaped) -> Self {
         self.segments.push(seg);
         self
     }
 
-    fn add_query_param(self, query_param: Param) -> Self {
+    fn add_query_param(mut self, query_param: Param) -> Self {
         self.query_params.push(query_param);
         self
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Escaped {
     raw: String,
 }
@@ -68,6 +79,7 @@ impl From<&str> for Escaped {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Param {
     Single(String, String),
     ArrayElem(String, String),
@@ -105,33 +117,37 @@ struct Raw;
 struct EmptyAPI;
 
 impl<Method, StatusCode, CTy, Ty> HasLink for Verb<Method, StatusCode, CTy, Ty> {
-    type MkLink<A> = A;
+    type MkLink<'a, A: 'a> = A;
 
-    fn to_link<A, F: Fn(Link) -> A>(self, f: F, link: Link) -> Self::MkLink<A> {
+    fn to_link<'a, A: 'a>(self, f: Rc<dyn Fn(Link) -> A + 'a>, link: Link) -> Self::MkLink<'a, A> {
         f(link)
     }
 }
 
 impl HasLink for Raw {
-    type MkLink<A> = A;
+    type MkLink<'a, A: 'a> = A;
 
-    fn to_link<A, F: Fn(Link) -> A>(self, f: F, link: Link) -> Self::MkLink<A> {
+    fn to_link<'a, A: 'a>(self, f: Rc<dyn Fn(Link) -> A + 'a>, link: Link) -> Self::MkLink<'a, A> {
         f(link)
     }
 }
 
 impl HasLink for EmptyAPI {
-    type MkLink<A> = EmptyAPI;
+    type MkLink<'a, A: 'a> = EmptyAPI;
 
-    fn to_link<A, F: Fn(Link) -> A>(self, _f: F, _link: Link) -> Self::MkLink<A> {
+    fn to_link<'a, A: 'a>(
+        self,
+        _f: Rc<dyn Fn(Link) -> A + 'a>,
+        _link: Link,
+    ) -> Self::MkLink<'a, A> {
         EmptyAPI
     }
 }
 
 impl<TStr: KnownString, Path: HasLink> HasLink for Sequence<Segment<TStr>, Path> {
-    type MkLink<A> = <Path as HasLink>::MkLink<A>;
+    type MkLink<'a, A: 'a> = <Path as HasLink>::MkLink<'a, A>;
 
-    fn to_link<A, F: Fn(Link) -> A>(self, f: F, link: Link) -> Self::MkLink<A> {
+    fn to_link<'a, A: 'a>(self, f: Rc<dyn Fn(Link) -> A + 'a>, link: Link) -> Self::MkLink<'a, A> {
         let seg = Escaped::from(<TStr as Default>::default().as_str());
         self.path.to_link(f, link.add_segment(seg))
     }
@@ -146,9 +162,10 @@ impl<Name: KnownString, Ty: ToHttpApiData, Path: HasLink> HasLink
 where
     Path: 'static,
 {
-    type MkLink<A> = Box<dyn Fn(Ty) -> <Path as HasLink>::MkLink<A>>;
+    // Oops, this is goofy
+    type MkLink<'a, A: 'a> = Box<dyn FnOnce(Ty) -> <Path as HasLink>::MkLink<'a, A> + 'a>;
 
-    fn to_link<A, F: Fn(Link) -> A>(self, f: F, link: Link) -> Self::MkLink<A> {
+    fn to_link<'a, A: 'a>(self, f: Rc<dyn Fn(Link) -> A + 'a>, link: Link) -> Self::MkLink<'a, A> {
         Box::new(|ty| {
             let query_param = Param::from((
                 <Name as Default>::default().as_str(),
@@ -158,4 +175,62 @@ where
             self.path.to_link(f, link.add_query_param(query_param))
         })
     }
+}
+
+#[derive(Debug, Copy, Clone, Default)]
+struct Foo;
+
+impl KnownString for Foo {
+    fn as_str(self) -> &'static str {
+        "foo"
+    }
+}
+
+#[test]
+fn example_0() {
+    type API = Sequence<Segment<Foo>, Verb<(), (), (), u32>>;
+
+    let api: API = Sequence {
+        component: Segment { tstr: Foo },
+        path: Verb {
+            method: (),
+            status_code: (),
+            cty: (),
+            ty: 100,
+        },
+    };
+    let l0: Link = api.to_link(Rc::new(|e| e), Default::default());
+    assert_eq!(l0.segments, vec![Escaped::from("foo")]);
+
+    struct Baloney;
+
+    let api = Sequence {
+        component: Segment { tstr: Foo },
+        path: Sequence {
+            component: QueryParam {
+                name: Foo,
+                ty: Baloney,
+            },
+            path: Verb {
+                method: (),
+                status_code: (),
+                cty: (),
+                ty: 100usize,
+            },
+        },
+    };
+
+    impl ToHttpApiData for Baloney {
+        fn to_url_piece(&self) -> String {
+            String::from("baloney")
+        }
+    }
+
+    let l1 = api.to_link(Rc::new(|e| e), Default::default())(Baloney);
+
+    assert_eq!(l1.segments, vec![Escaped::from("foo")]);
+    assert_eq!(
+        l1.query_params,
+        vec![Param::Single(String::from("foo"), String::from("baloney"))]
+    );
 }
